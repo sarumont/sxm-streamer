@@ -401,6 +401,18 @@ class StreamServer:
                     self._active_processes.pop(pid, None)
                 log.debug(f"Cleaned up ffmpeg (pid={pid}) for '{channel_id}'")
 
+    async def _handle_channels(self, request: web.Request) -> web.Response:
+        """GET /channels/ -- list known channels with metadata."""
+        channels = []
+        for channel_id, name in sorted(self._channel_names.items()):
+            channels.append({
+                "id": channel_id,
+                "name": name,
+                "stream_url": f"http://{request.host}/{channel_id}.mp3",
+                "art_url": self._channel_art.get(channel_id),
+            })
+        return web.json_response(channels)
+
     async def _handle_now_playing(self, request: web.Request) -> web.Response:
         """GET /now-playing/{channel}.json"""
         channel_id = request.match_info.get("channel", "")
@@ -448,6 +460,7 @@ class StreamServer:
 
         # Specific routes first (matched before catch-all)
         app.router.add_get("/", self._handle_index)
+        app.router.add_get("/channels/", self._handle_channels)
         app.router.add_get("/now-playing/{channel}.json", self._handle_now_playing)
         app.router.add_get("/{channel}.mp3", self._handle_mp3_stream)
 
