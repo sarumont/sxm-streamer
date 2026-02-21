@@ -50,7 +50,8 @@ class StreamServer:
         self._active_processes: Dict[int, asyncio.subprocess.Process] = {}
         self._now_playing: Dict[str, NowPlaying] = {}
 
-        # Album art
+        # Channel metadata
+        self._channel_names: Dict[str, str] = {}  # channel_id -> display name
         self._art_cache: Dict[str, Tuple[bytes, str]] = {}  # url -> (data, mime)
         self._channel_art: Dict[str, str] = {}  # channel_id -> fallback image URL
 
@@ -115,14 +116,14 @@ class StreamServer:
                 title=song.title,
                 artist=artist,
                 art_url=art_url,
-                channel_name=channel_id,
+                channel_name=self._channel_display_name(channel_id),
                 updated_at=time.monotonic(),
             )
         elif latest_cut:
             self._now_playing[channel_id] = NowPlaying(
                 title=latest_cut.cut.title,
                 artist="",
-                channel_name=channel_id,
+                channel_name=self._channel_display_name(channel_id),
                 updated_at=time.monotonic(),
             )
 
@@ -207,6 +208,9 @@ class StreamServer:
 
     # -- Helpers --
 
+    def _channel_display_name(self, channel_id: str) -> str:
+        return self._channel_names.get(channel_id, channel_id)
+
     def _resolve_bitrate(self, override: Optional[str] = None) -> str:
         if override:
             return override
@@ -234,7 +238,7 @@ class StreamServer:
             else:
                 stream_title = np.title
         else:
-            stream_title = f"SiriusXM - {channel_id}"
+            stream_title = f"SiriusXM - {self._channel_display_name(channel_id)}"
 
         stream_url = ""
         if np and np.art_url and (time.monotonic() - np.updated_at) < 60:
@@ -306,7 +310,7 @@ class StreamServer:
                 "Content-Type": "audio/mpeg",
                 "Cache-Control": "no-cache, no-store",
                 "Connection": "keep-alive",
-                "icy-name": f"SiriusXM - {channel_id}",
+                "icy-name": f"SiriusXM - {self._channel_display_name(channel_id)}",
             }
 
             if icy_requested:
@@ -459,6 +463,8 @@ class StreamServer:
             if raw_channels:
                 for raw in raw_channels:
                     ch = XMChannel.from_dict(raw) if isinstance(raw, dict) else raw
+                    if ch.name:
+                        self._channel_names[ch.id] = ch.name
                     if ch.images:
                         # Pick the largest image available
                         best = max(
