@@ -1,6 +1,7 @@
 """StreamServer: single-process aiohttp server for SXM HLS + MP3 streaming."""
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -26,6 +27,7 @@ ICY_INTERVAL = 16000  # bytes between metadata blocks
 class NowPlaying:
     title: str = ""
     artist: str = ""
+    art_url: str = ""
     channel_name: str = ""
     updated_at: float = field(default_factory=time.monotonic)
 
@@ -51,6 +53,8 @@ class StreamServer:
     def handle_metadata_update(self, data: dict) -> None:
         """Called by SXMClientAsync when an HLS playlist is fetched."""
 
+        log.debug("Raw metadata update:\n%s", json.dumps(data, indent=2, default=str))
+
         try:
             live = XMLiveChannel.from_dict(data)
         except Exception as e:
@@ -67,14 +71,44 @@ class StreamServer:
             radio_time = now
 
         latest_cut = live.get_latest_cut(radio_time)
+
+        if latest_cut:
+            cut = latest_cut.cut
+            log.debug(
+                "Channel %s latest_cut: type=%s, cut_type=%s, title=%r, "
+                "cut attrs=%s",
+                channel_id,
+                type(cut).__name__,
+                getattr(cut, "cut_type", None),
+                getattr(cut, "title", None),
+                [a for a in dir(cut) if not a.startswith("_")],
+            )
+            if isinstance(cut, XMSong):
+                log.debug(
+                    "  Song detail: artists=%r, album=%r, "
+                    "album.arts=%r, itunes_id=%r",
+                    cut.artists,
+                    cut.album,
+                    cut.album.arts if cut.album else None,
+                    getattr(cut, "itunes_id", None),
+                )
+        else:
+            log.debug("Channel %s: no latest_cut at radio_time=%s", channel_id, radio_time)
+
         if latest_cut and isinstance(latest_cut.cut, XMSong):
             song = latest_cut.cut
             artist = (
                 ", ".join(a.name for a in song.artists) if song.artists else ""
             )
+            art_url = ""
+            if song.album and song.album.arts:
+                art_url = song.album.arts[0].url
+            if not art_url:
+                art_url = self._extract_cut_art(data, latest_cut.guid)
             self._now_playing[channel_id] = NowPlaying(
                 title=song.title,
                 artist=artist,
+                art_url=art_url,
                 channel_name=channel_id,
                 updated_at=time.monotonic(),
             )
@@ -85,6 +119,25 @@ class StreamServer:
                 channel_name=channel_id,
                 updated_at=time.monotonic(),
             )
+
+    @staticmethod
+    def _extract_cut_art(data: dict, guid: str) -> str:
+        """Fallback: extract art URL from raw cut-level creativeArts."""
+        try:
+            markers = (
+                data.get("moduleResponse", {})
+                .get("liveChannelData", {})
+                .get("cutMarker", [])
+            )
+            for marker in markers:
+                if marker.get("assetGUID") != guid:
+                    continue
+                for art in marker.get("cut", {}).get("creativeArts", []):
+                    if art.get("type") == "IMAGE" and art.get("url"):
+                        return art["url"]
+        except (KeyError, TypeError):
+            pass
+        return ""
 
     # -- Helpers --
 
@@ -117,7 +170,13 @@ class StreamServer:
         else:
             stream_title = f"SiriusXM - {channel_id}"
 
+        stream_url = ""
+        if np and np.art_url and (time.monotonic() - np.updated_at) < 60:
+            stream_url = np.art_url
+
         meta_str = f"StreamTitle='{stream_title}';"
+        if stream_url:
+            meta_str += f"StreamUrl='{stream_url}';"
         meta_bytes = meta_str.encode("utf-8")
 
         # Length byte = ceil(len / 16), actual block padded to length * 16
@@ -253,6 +312,7 @@ class StreamServer:
                 "channel": channel_id,
                 "title": np.title,
                 "artist": np.artist,
+                "art_url": np.art_url or None,
                 "stale": (time.monotonic() - np.updated_at) > 60,
             })
         return web.json_response({
