@@ -6,11 +6,13 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
-from aiohttp import web
+from aiohttp import ClientSession, ClientTimeout, web
 from sxm import QualitySize, make_http_handler
-from sxm.models import XMLiveChannel, XMSong
+from sxm.models import XMChannel, XMLiveChannel, XMSong
+
+from .id3 import build_id3v2_tag, detect_image_mime
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +49,12 @@ class StreamServer:
 
         self._active_processes: Dict[int, asyncio.subprocess.Process] = {}
         self._now_playing: Dict[str, NowPlaying] = {}
+
+        # Channel metadata
+        self._channel_names: Dict[str, str] = {}  # channel_id -> display name
+        self._art_cache: Dict[str, Tuple[bytes, str]] = {}  # url -> (data, mime)
+        self._channel_art: Dict[str, str] = {}  # channel_id -> fallback image URL
+        self._id3_tags: Dict[str, bytes] = {}  # channel_id -> pre-built ID3v2 tag
 
     # -- Metadata handling (update_handler callback) --
 
@@ -109,16 +117,20 @@ class StreamServer:
                 title=song.title,
                 artist=artist,
                 art_url=art_url,
-                channel_name=channel_id,
+                channel_name=self._channel_display_name(channel_id),
                 updated_at=time.monotonic(),
             )
+            self._id3_tags[channel_id] = build_id3v2_tag(song.title, artist)
+            self._schedule_art_refresh(channel_id)
         elif latest_cut:
             self._now_playing[channel_id] = NowPlaying(
                 title=latest_cut.cut.title,
                 artist="",
-                channel_name=channel_id,
+                channel_name=self._channel_display_name(channel_id),
                 updated_at=time.monotonic(),
             )
+            self._id3_tags[channel_id] = build_id3v2_tag(latest_cut.cut.title)
+            self._schedule_art_refresh(channel_id)
 
     @staticmethod
     def _extract_cut_art(data: dict, guid: str) -> str:
@@ -139,7 +151,78 @@ class StreamServer:
             pass
         return ""
 
+    # -- Album art --
+
+    async def _fetch_art(self, art_url: str) -> Optional[Tuple[bytes, str]]:
+        """Download and cache an art image. Returns (data, mime) or None."""
+        if not art_url:
+            return None
+
+        cached = self._art_cache.get(art_url)
+        if cached is not None:
+            return cached
+
+        try:
+            timeout = ClientTimeout(total=10)
+            async with ClientSession(timeout=timeout) as session:
+                async with session.get(art_url) as resp:
+                    if resp.status != 200:
+                        log.debug("Art download failed (%s): %s", resp.status, art_url)
+                        return None
+                    data = await resp.read()
+        except Exception as e:
+            log.debug("Art download error for %s: %s", art_url, e)
+            return None
+
+        mime = detect_image_mime(data)
+
+        # Evict oldest entries if cache is too large
+        if len(self._art_cache) >= 50:
+            oldest_key = next(iter(self._art_cache))
+            del self._art_cache[oldest_key]
+
+        self._art_cache[art_url] = (data, mime)
+        return (data, mime)
+
+    def _schedule_art_refresh(self, channel_id: str) -> None:
+        """Fire-and-forget background task to fetch art and rebuild the ID3 tag."""
+        try:
+            loop = asyncio.get_event_loop()
+            loop.create_task(self._refresh_id3_art(channel_id))
+        except RuntimeError:
+            pass
+
+    async def _refresh_id3_art(self, channel_id: str) -> None:
+        """Background: fetch art image and rebuild the ID3 tag with it."""
+        np = self._now_playing.get(channel_id)
+        if not np:
+            return
+
+        image_data = None
+        image_mime = ""
+        art_url = np.art_url or self._channel_art.get(channel_id, "")
+        if art_url:
+            result = await self._fetch_art(art_url)
+            if result:
+                image_data, image_mime = result
+
+        if not image_data:
+            fallback_url = self._channel_art.get(channel_id, "")
+            if fallback_url and fallback_url != art_url:
+                result = await self._fetch_art(fallback_url)
+                if result:
+                    image_data, image_mime = result
+
+        # Only update if this is still the current now-playing
+        if self._now_playing.get(channel_id) is np:
+            self._id3_tags[channel_id] = build_id3v2_tag(
+                np.title, np.artist, image_data, image_mime
+            )
+
     # -- Helpers --
+
+    def _channel_display_name(self, channel_id: str) -> str:
+        return self._channel_names.get(channel_id, channel_id)
 
     def _resolve_bitrate(self, override: Optional[str] = None) -> str:
         if override:
@@ -168,7 +251,7 @@ class StreamServer:
             else:
                 stream_title = np.title
         else:
-            stream_title = f"SiriusXM - {channel_id}"
+            stream_title = f"SiriusXM - {self._channel_display_name(channel_id)}"
 
         stream_url = ""
         if np and np.art_url and (time.monotonic() - np.updated_at) < 60:
@@ -240,7 +323,7 @@ class StreamServer:
                 "Content-Type": "audio/mpeg",
                 "Cache-Control": "no-cache, no-store",
                 "Connection": "keep-alive",
-                "icy-name": f"SiriusXM - {channel_id}",
+                "icy-name": f"SiriusXM - {self._channel_display_name(channel_id)}",
             }
 
             if icy_requested:
@@ -253,11 +336,19 @@ class StreamServer:
 
             assert process.stdout is not None
 
+            last_meta_time = 0.0
+
             if not icy_requested:
                 while True:
                     chunk = await process.stdout.read(4096)
                     if not chunk:
                         break
+                    np = self._now_playing.get(channel_id)
+                    if np and np.updated_at > last_meta_time:
+                        id3_tag = self._id3_tags.get(channel_id, b"")
+                        if id3_tag:
+                            await response.write(id3_tag)
+                        last_meta_time = np.updated_at
                     await response.write(chunk)
             else:
                 bytes_since_meta = 0
@@ -265,6 +356,13 @@ class StreamServer:
                     chunk = await process.stdout.read(4096)
                     if not chunk:
                         break
+
+                    np = self._now_playing.get(channel_id)
+                    if np and np.updated_at > last_meta_time:
+                        id3_tag = self._id3_tags.get(channel_id, b"")
+                        if id3_tag:
+                            last_meta_time = np.updated_at
+                            chunk = id3_tag + chunk
 
                     pos = 0
                     while pos < len(chunk):
@@ -371,6 +469,26 @@ class StreamServer:
             f"Authenticated. Serving on http://{self._host}:{self._port} "
             f"(quality: {self._quality.name}, bitrate: {self._resolve_bitrate()})"
         )
+
+        # Populate channel art fallbacks
+        try:
+            raw_channels = await self._client.channels
+            if raw_channels:
+                for raw in raw_channels:
+                    ch = XMChannel.from_dict(raw) if isinstance(raw, dict) else raw
+                    if ch.name:
+                        self._channel_names[ch.id] = ch.name
+                    if ch.images:
+                        # Pick the largest image available
+                        best = max(
+                            ch.images,
+                            key=lambda img: (img.width or 0) * (img.height or 0),
+                        )
+                        if best.url:
+                            self._channel_art[ch.id] = best.url
+                log.info("Loaded channel art for %d channels", len(self._channel_art))
+        except Exception as e:
+            log.warning("Failed to load channel art: %s", e)
 
     async def _on_shutdown(self, app: web.Application) -> None:
         for pid, process in list(self._active_processes.items()):
