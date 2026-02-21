@@ -6,11 +6,13 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
-from aiohttp import web
+from aiohttp import ClientSession, ClientTimeout, web
 from sxm import QualitySize, make_http_handler
-from sxm.models import XMLiveChannel, XMSong
+from sxm.models import XMChannel, XMLiveChannel, XMSong
+
+from .id3 import build_id3v2_tag, detect_image_mime
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +49,10 @@ class StreamServer:
 
         self._active_processes: Dict[int, asyncio.subprocess.Process] = {}
         self._now_playing: Dict[str, NowPlaying] = {}
+
+        # Album art
+        self._art_cache: Dict[str, Tuple[bytes, str]] = {}  # url -> (data, mime)
+        self._channel_art: Dict[str, str] = {}  # channel_id -> fallback image URL
 
     # -- Metadata handling (update_handler callback) --
 
@@ -138,6 +144,66 @@ class StreamServer:
         except (KeyError, TypeError):
             pass
         return ""
+
+    # -- Album art --
+
+    async def _fetch_art(self, art_url: str) -> Optional[Tuple[bytes, str]]:
+        """Download and cache an art image. Returns (data, mime) or None."""
+        if not art_url:
+            return None
+
+        cached = self._art_cache.get(art_url)
+        if cached is not None:
+            return cached
+
+        try:
+            timeout = ClientTimeout(total=10)
+            async with ClientSession(timeout=timeout) as session:
+                async with session.get(art_url) as resp:
+                    if resp.status != 200:
+                        log.debug("Art download failed (%s): %s", resp.status, art_url)
+                        return None
+                    data = await resp.read()
+        except Exception as e:
+            log.debug("Art download error for %s: %s", art_url, e)
+            return None
+
+        mime = detect_image_mime(data)
+
+        # Evict oldest entries if cache is too large
+        if len(self._art_cache) >= 50:
+            oldest_key = next(iter(self._art_cache))
+            del self._art_cache[oldest_key]
+
+        self._art_cache[art_url] = (data, mime)
+        return (data, mime)
+
+    async def _build_id3_tag(self, channel_id: str) -> bytes:
+        """Build an ID3v2 tag for the current now-playing on a channel."""
+        np = self._now_playing.get(channel_id)
+        if not np:
+            return b""
+
+        title = np.title
+        artist = np.artist
+
+        # Try album art, then fall back to channel logo
+        image_data = None
+        image_mime = ""
+        art_url = np.art_url or self._channel_art.get(channel_id, "")
+        if art_url:
+            result = await self._fetch_art(art_url)
+            if result:
+                image_data, image_mime = result
+
+        if not image_data:
+            fallback_url = self._channel_art.get(channel_id, "")
+            if fallback_url and fallback_url != art_url:
+                result = await self._fetch_art(fallback_url)
+                if result:
+                    image_data, image_mime = result
+
+        return build_id3v2_tag(title, artist, image_data, image_mime)
 
     # -- Helpers --
 
@@ -253,11 +319,19 @@ class StreamServer:
 
             assert process.stdout is not None
 
+            last_meta_time = 0.0
+
             if not icy_requested:
                 while True:
                     chunk = await process.stdout.read(4096)
                     if not chunk:
                         break
+                    np = self._now_playing.get(channel_id)
+                    if np and np.updated_at > last_meta_time:
+                        id3_tag = await self._build_id3_tag(channel_id)
+                        if id3_tag:
+                            await response.write(id3_tag)
+                        last_meta_time = np.updated_at
                     await response.write(chunk)
             else:
                 bytes_since_meta = 0
@@ -265,6 +339,13 @@ class StreamServer:
                     chunk = await process.stdout.read(4096)
                     if not chunk:
                         break
+
+                    np = self._now_playing.get(channel_id)
+                    if np and np.updated_at > last_meta_time:
+                        id3_tag = await self._build_id3_tag(channel_id)
+                        if id3_tag:
+                            last_meta_time = np.updated_at
+                            chunk = id3_tag + chunk
 
                     pos = 0
                     while pos < len(chunk):
@@ -371,6 +452,24 @@ class StreamServer:
             f"Authenticated. Serving on http://{self._host}:{self._port} "
             f"(quality: {self._quality.name}, bitrate: {self._resolve_bitrate()})"
         )
+
+        # Populate channel art fallbacks
+        try:
+            raw_channels = await self._client.channels
+            if raw_channels:
+                for raw in raw_channels:
+                    ch = XMChannel.from_dict(raw) if isinstance(raw, dict) else raw
+                    if ch.images:
+                        # Pick the largest image available
+                        best = max(
+                            ch.images,
+                            key=lambda img: (img.width or 0) * (img.height or 0),
+                        )
+                        if best.url:
+                            self._channel_art[ch.id] = best.url
+                log.info("Loaded channel art for %d channels", len(self._channel_art))
+        except Exception as e:
+            log.warning("Failed to load channel art: %s", e)
 
     async def _on_shutdown(self, app: web.Application) -> None:
         for pid, process in list(self._active_processes.items()):
