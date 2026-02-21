@@ -492,13 +492,25 @@ class StreamServer:
                     if ch.name:
                         self._channel_names[ch.id] = ch.name
                     if ch.images:
-                        # Pick the largest image available
-                        best = max(
-                            ch.images,
-                            key=lambda img: (img.width or 0) * (img.height or 0),
-                        )
-                        if best.url:
-                            self._channel_art[ch.id] = best.url
+                        # Prefer square logo images, fall back to largest
+                        logo = None
+                        for img in ch.images:
+                            if not img.url:
+                                continue
+                            n = (img.name or "").lower()
+                            if img.height and img.width and img.height == img.width:
+                                if "logo" in n:
+                                    logo = img
+                                    break
+                                if not logo:
+                                    logo = img
+                        if not logo:
+                            logo = max(
+                                ch.images,
+                                key=lambda img: (img.width or 0) * (img.height or 0),
+                            )
+                        if logo and logo.url:
+                            self._channel_art[ch.id] = logo.url
                 log.info("Loaded channel art for %d channels", len(self._channel_art))
         except Exception as e:
             log.warning("Failed to load channel art: %s", e)
