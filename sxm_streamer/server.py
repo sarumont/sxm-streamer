@@ -54,6 +54,7 @@ class StreamServer:
         self._channel_names: Dict[str, str] = {}  # channel_id -> display name
         self._art_cache: Dict[str, Tuple[bytes, str]] = {}  # url -> (data, mime)
         self._channel_art: Dict[str, str] = {}  # channel_id -> fallback image URL
+        self._id3_tags: Dict[str, bytes] = {}  # channel_id -> pre-built ID3v2 tag
 
     # -- Metadata handling (update_handler callback) --
 
@@ -119,6 +120,8 @@ class StreamServer:
                 channel_name=self._channel_display_name(channel_id),
                 updated_at=time.monotonic(),
             )
+            self._id3_tags[channel_id] = build_id3v2_tag(song.title, artist)
+            self._schedule_art_refresh(channel_id)
         elif latest_cut:
             self._now_playing[channel_id] = NowPlaying(
                 title=latest_cut.cut.title,
@@ -126,6 +129,8 @@ class StreamServer:
                 channel_name=self._channel_display_name(channel_id),
                 updated_at=time.monotonic(),
             )
+            self._id3_tags[channel_id] = build_id3v2_tag(latest_cut.cut.title)
+            self._schedule_art_refresh(channel_id)
 
     @staticmethod
     def _extract_cut_art(data: dict, guid: str) -> str:
@@ -179,16 +184,20 @@ class StreamServer:
         self._art_cache[art_url] = (data, mime)
         return (data, mime)
 
-    async def _build_id3_tag(self, channel_id: str) -> bytes:
-        """Build an ID3v2 tag for the current now-playing on a channel."""
+    def _schedule_art_refresh(self, channel_id: str) -> None:
+        """Fire-and-forget background task to fetch art and rebuild the ID3 tag."""
+        try:
+            loop = asyncio.get_event_loop()
+            loop.create_task(self._refresh_id3_art(channel_id))
+        except RuntimeError:
+            pass
+
+    async def _refresh_id3_art(self, channel_id: str) -> None:
+        """Background: fetch art image and rebuild the ID3 tag with it."""
         np = self._now_playing.get(channel_id)
         if not np:
-            return b""
+            return
 
-        title = np.title
-        artist = np.artist
-
-        # Try album art, then fall back to channel logo
         image_data = None
         image_mime = ""
         art_url = np.art_url or self._channel_art.get(channel_id, "")
@@ -204,7 +213,11 @@ class StreamServer:
                 if result:
                     image_data, image_mime = result
 
-        return build_id3v2_tag(title, artist, image_data, image_mime)
+        # Only update if this is still the current now-playing
+        if self._now_playing.get(channel_id) is np:
+            self._id3_tags[channel_id] = build_id3v2_tag(
+                np.title, np.artist, image_data, image_mime
+            )
 
     # -- Helpers --
 
@@ -332,7 +345,7 @@ class StreamServer:
                         break
                     np = self._now_playing.get(channel_id)
                     if np and np.updated_at > last_meta_time:
-                        id3_tag = await self._build_id3_tag(channel_id)
+                        id3_tag = self._id3_tags.get(channel_id, b"")
                         if id3_tag:
                             await response.write(id3_tag)
                         last_meta_time = np.updated_at
@@ -346,7 +359,7 @@ class StreamServer:
 
                     np = self._now_playing.get(channel_id)
                     if np and np.updated_at > last_meta_time:
-                        id3_tag = await self._build_id3_tag(channel_id)
+                        id3_tag = self._id3_tags.get(channel_id, b"")
                         if id3_tag:
                             last_meta_time = np.updated_at
                             chunk = id3_tag + chunk
