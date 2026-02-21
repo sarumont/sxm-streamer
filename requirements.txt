@@ -1,0 +1,61 @@
+#
+# Pinned dependencies for sxm-streamer (trimmed from sxm-player)
+#
+aiohttp==3.7.4.post0
+    # via sxm
+anyio==3.3.0
+    # via httpcore
+async-timeout==3.0.1
+    # via aiohttp
+attrs==21.2.0
+    # via aiohttp
+certifi==2021.5.30
+    # via httpx
+chardet==4.0.0
+    # via aiohttp
+click==7.1.2
+    # via typer
+fake-useragent==0.1.11
+    # via sxm
+h11==0.12.0
+    # via httpcore
+httpcore==0.13.6
+    # via httpx
+httpx==0.18.2
+    # via sxm
+idna==3.2
+    # via
+    #   anyio
+    #   rfc3986
+    #   yarl
+make-it-sync==1.0.0
+    # via sxm
+multidict==5.1.0
+    # via
+    #   aiohttp
+    #   yarl
+pydantic==1.8.2
+    # via sxm
+python-dotenv==0.18.0
+    # via sxm
+rfc3986[idna2008]==1.5.0
+    # via httpx
+sniffio==1.2.0
+    # via
+    #   anyio
+    #   httpcore
+    #   httpx
+sxm==0.2.8
+    # via sxm-streamer
+tenacity==8.0.1
+    # via sxm
+typer==0.3.2
+    # via sxm
+typing-extensions==3.10.0.0
+    # via
+    #   aiohttp
+    #   pydantic
+ua-parser==0.10.0
+    # via sxm
+yarl==1.6.3
+    # via aiohttp

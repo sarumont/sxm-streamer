@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sxm-streamer"
+version = "0.1.0"
+description = "Lightweight SiriusXM streaming server (HLS + MP3)"
+requires-python = ">=3.9"
+license = "GPL-3.0-only"
+dependencies = [
+    "sxm==0.2.8",
+]
+
+[project.scripts]
+sxm-streamer = "sxm_streamer.cli:app"

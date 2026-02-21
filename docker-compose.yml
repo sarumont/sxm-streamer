@@ -1,0 +1,9 @@
+services:
+  sxm-streamer:
+    build: .
+    container_name: sxm-streamer
+    restart: unless-stopped
+    ports:
+      - "9999:9999"
+    env_file:
+      - .env
