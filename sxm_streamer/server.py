@@ -26,6 +26,7 @@ ICY_INTERVAL = 16000  # bytes between metadata blocks
 class NowPlaying:
     title: str = ""
     artist: str = ""
+    art_url: str = ""
     channel_name: str = ""
     updated_at: float = field(default_factory=time.monotonic)
 
@@ -72,9 +73,13 @@ class StreamServer:
             artist = (
                 ", ".join(a.name for a in song.artists) if song.artists else ""
             )
+            art_url = ""
+            if song.album and song.album.arts:
+                art_url = song.album.arts[0].url
             self._now_playing[channel_id] = NowPlaying(
                 title=song.title,
                 artist=artist,
+                art_url=art_url,
                 channel_name=channel_id,
                 updated_at=time.monotonic(),
             )
@@ -117,7 +122,13 @@ class StreamServer:
         else:
             stream_title = f"SiriusXM - {channel_id}"
 
+        stream_url = ""
+        if np and np.art_url and (time.monotonic() - np.updated_at) < 60:
+            stream_url = np.art_url
+
         meta_str = f"StreamTitle='{stream_title}';"
+        if stream_url:
+            meta_str += f"StreamUrl='{stream_url}';"
         meta_bytes = meta_str.encode("utf-8")
 
         # Length byte = ceil(len / 16), actual block padded to length * 16
@@ -253,6 +264,7 @@ class StreamServer:
                 "channel": channel_id,
                 "title": np.title,
                 "artist": np.artist,
+                "art_url": np.art_url or None,
                 "stale": (time.monotonic() - np.updated_at) > 60,
             })
         return web.json_response({
