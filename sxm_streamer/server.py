@@ -272,6 +272,30 @@ class StreamServer:
 
     # -- HTTP handlers --
 
+    async def _write_icy_chunks(
+        self,
+        response: web.StreamResponse,
+        channel_id: str,
+        chunks,
+        bytes_since_meta: int,
+    ) -> int:
+        """Write chunks through ICY interleaving. Returns updated bytes_since_meta."""
+        async for chunk in chunks:
+            pos = 0
+            while pos < len(chunk):
+                remaining = ICY_INTERVAL - bytes_since_meta
+                available = len(chunk) - pos
+                if available <= remaining:
+                    await response.write(chunk[pos:])
+                    bytes_since_meta += available
+                    pos = len(chunk)
+                else:
+                    await response.write(chunk[pos : pos + remaining])
+                    pos += remaining
+                    bytes_since_meta = 0
+                    await response.write(self._build_icy_block(channel_id))
+        return bytes_since_meta
+
     async def _handle_mp3_stream(self, request: web.Request) -> web.StreamResponse:
         """Handle GET /{channel}.mp3 -- spawn ffmpeg and stream MP3."""
 
@@ -303,22 +327,6 @@ class StreamServer:
             if pid is not None:
                 self._active_processes[pid] = process
 
-            # Give ffmpeg a moment to fail on invalid channels
-            await asyncio.sleep(1.0)
-
-            if process.returncode is not None:
-                stderr_output = b""
-                if process.stderr:
-                    stderr_output = await process.stderr.read()
-                log.warning(
-                    f"ffmpeg exited immediately for '{channel_id}': "
-                    f"{stderr_output.decode('utf-8', errors='replace').strip()}"
-                )
-                return web.Response(
-                    status=404,
-                    text=f"Channel '{channel_id}' not found or unavailable",
-                )
-
             response_headers = {
                 "Content-Type": "audio/mpeg",
                 "Cache-Control": "no-cache, no-store",
@@ -336,50 +344,61 @@ class StreamServer:
 
             assert process.stdout is not None
 
-            last_meta_time = 0.0
+            # Wait for the first chunk to verify the channel is producing output.
+            # Sending headers first avoids a 1-second delay that caused clients
+            # (e.g. Roon) to time out before receiving an HTTP response.
+            try:
+                first_chunk = await asyncio.wait_for(
+                    process.stdout.read(4096), timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                stderr_out = b""
+                if process.stderr:
+                    stderr_out = await asyncio.wait_for(process.stderr.read(), timeout=2.0)
+                log.warning(
+                    f"ffmpeg produced no output for '{channel_id}': "
+                    f"{stderr_out.decode('utf-8', errors='replace').strip()}"
+                )
+                return response
+
+            if not first_chunk:
+                stderr_out = b""
+                if process.stderr:
+                    stderr_out = await asyncio.wait_for(process.stderr.read(), timeout=2.0)
+                log.warning(
+                    f"ffmpeg exited with no output for '{channel_id}': "
+                    f"{stderr_out.decode('utf-8', errors='replace').strip()}"
+                )
+                return response
+
+            async def remaining_chunks():
+                while True:
+                    chunk = await process.stdout.read(4096)
+                    if not chunk:
+                        return
+                    yield chunk
 
             if not icy_requested:
-                while True:
-                    chunk = await process.stdout.read(4096)
-                    if not chunk:
-                        break
-                    np = self._now_playing.get(channel_id)
-                    if np and np.updated_at > last_meta_time:
-                        id3_tag = self._id3_tags.get(channel_id, b"")
-                        if id3_tag:
-                            await response.write(id3_tag)
-                        last_meta_time = np.updated_at
+                # Inject ID3 tag once at stream start (before any audio data)
+                id3_tag = self._id3_tags.get(channel_id, b"")
+                if id3_tag:
+                    await response.write(id3_tag)
+                await response.write(first_chunk)
+                async for chunk in remaining_chunks():
                     await response.write(chunk)
             else:
+                # ICY: interleave metadata blocks at fixed byte intervals.
+                # No ID3 injection — that would corrupt frame sync and ICY offsets.
                 bytes_since_meta = 0
-                while True:
-                    chunk = await process.stdout.read(4096)
-                    if not chunk:
-                        break
 
-                    np = self._now_playing.get(channel_id)
-                    if np and np.updated_at > last_meta_time:
-                        id3_tag = self._id3_tags.get(channel_id, b"")
-                        if id3_tag:
-                            last_meta_time = np.updated_at
-                            chunk = id3_tag + chunk
+                async def all_chunks():
+                    yield first_chunk
+                    async for c in remaining_chunks():
+                        yield c
 
-                    pos = 0
-                    while pos < len(chunk):
-                        remaining = ICY_INTERVAL - bytes_since_meta
-                        available = len(chunk) - pos
-
-                        if available <= remaining:
-                            await response.write(chunk[pos:])
-                            bytes_since_meta += available
-                            pos = len(chunk)
-                        else:
-                            await response.write(chunk[pos : pos + remaining])
-                            pos += remaining
-                            bytes_since_meta = 0
-
-                            meta_block = self._build_icy_block(channel_id)
-                            await response.write(meta_block)
+                await self._write_icy_chunks(
+                    response, channel_id, all_chunks(), bytes_since_meta
+                )
 
             return response
 
